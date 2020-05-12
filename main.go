@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drone/drone-plugin-go/plugin"
@@ -77,19 +78,57 @@ func wrapMain() error {
 	// Trim whitespace, to forgive the vagaries of YAML parsing.
 	vargs.Key = strings.TrimSpace(vargs.Key)
 
-	// point to file in workspace
-	vargs.Spec = filepath.Join(vargs.workspace, vargs.Spec)
+	specs, err := filepath.Glob(vargs.Spec)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Glob specs ", specs)
 
+	if specs == nil {
+		specs = []string{vargs.Spec}
+	}
+	fmt.Println("total specs", specs)
+
+	errChan := make(chan error, len(specs))
+	var wg sync.WaitGroup
+	for _, spec := range specs {
+		fmt.Println("Creating go func for", spec)
+		wg.Add(1)
+		go checkAndPublishSpec(vargs, spec, errChan, &wg)
+	}
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+	<-errChan
+
+	if len(errChan) > 0 {
+		return errors.New("Error publishing specs")
+	}
+
+	return nil
+}
+
+func checkAndPublishSpec(vargs API, spec string, ch chan error, wg *sync.WaitGroup) {
+	fmt.Println("Uploading ", spec)
+
+	vargs.Spec = filepath.Join(vargs.workspace, spec)
+	var err error
 	// check spec ext to see if we need to convert YAML => JSON
 	if ext := filepath.Ext(vargs.Spec); ext == ".yaml" || ext == ".yml" {
 		vargs.Spec, err = convertToJSON(vargs.Spec)
 		if err != nil {
-			return err
+			ch <- err
 		}
 	}
-
 	// post the file with timeout + retry
-	return publishSpec(vargs)
+	err = publishSpec(vargs)
+	if err != nil {
+		ch <- err
+	}
+	ch <- nil
+	wg.Done()
 }
 
 func publishSpec(vargs API) error {
